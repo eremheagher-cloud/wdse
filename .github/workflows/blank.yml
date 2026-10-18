@@ -1,190 +1,98 @@
-name: PC criado pelo @alves7.pcm
+
+name: Testar ISO Windows 11 26H2
 
 on:
   workflow_dispatch:
     inputs:
-      instance_number:
-        description: "Instance Number (1-10)"
+      iso_url:
+        description: "URL direta da ISO no GitHub Release"
         required: true
-        default: "1"
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  deploy-rdp:
-    runs-on: windows-2022
-    timeout-minutes: 360
+  test-iso:
+    runs-on: windows-2025
+    timeout-minutes: 30
 
     steps:
-      - name: Check Windows
+      - name: Verificar recursos do runner
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version
+          $ErrorActionPreference = "Stop"
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $installer = "$env:TEMP\tailscale-setup.exe"
+          Write-Host "=== SISTEMA ==="
+          Get-ComputerInfo |
+            Select-Object WindowsProductName,
+              WindowsVersion, OsArchitecture
 
-          Invoke-WebRequest `
-            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
-            -OutFile $installer
+          Write-Host "=== ESPACO DISPONIVEL ==="
+          Get-PSDrive -Name C |
+            Select-Object Name, Used, Free
 
-          Start-Process `
-            -FilePath $installer `
-            -ArgumentList '/quiet' `
-            -Wait
+          Write-Host "=== VIRTUALIZACAO ==="
+          Get-CimInstance Win32_Processor |
+            Select-Object Name,
+              VirtualizationFirmwareEnabled,
+              VMMonitorModeExtensions
 
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "=== HYPER-V ==="
+          Get-Command Get-VM `
+            -ErrorAction SilentlyContinue
 
-          if (!(Test-Path $tailscale)) {
-            throw 'Tailscale installation failed.'
-          }
-
-          Write-Host 'Tailscale installed successfully.'
-
-      - name: Connect Tailscale
+      - name: Baixar e verificar ISO
         shell: pwsh
         env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          ISO_URL: ${{ inputs.iso_url }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw 'Missing TAILSCALE_AUTH_KEY in repository Actions secrets.'
+          if ($env:ISO_URL -notmatch '^https://') {
+            throw "Informe um URL HTTPS valido."
           }
 
-          & $tailscale up `
-            "--auth-key=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=pc-rafael-${{ inputs.instance_number }}"
+          $iso = Join-Path $env:RUNNER_TEMP `
+            "windows-26h2.iso"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale authentication failed: exit code $LASTEXITCODE"
+          $drive = Get-PSDrive -Name C
+          $freeGB = $drive.Free / 1GB
+
+          Write-Host "Espaco livre: $([math]::Round($freeGB, 2)) GB"
+
+          if ($freeGB -lt 12) {
+            throw "Espaco insuficiente para baixar uma ISO grande."
           }
 
-          Start-Sleep -Seconds 5
+          Write-Host "Baixando ISO..."
+          Invoke-WebRequest `
+            -Uri $env:ISO_URL `
+            -OutFile $iso
 
-          & $tailscale status
+          $file = Get-Item $iso
 
-          $ipOutput = & $tailscale ip -4
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Could not retrieve the Tailscale IP.'
+          if ($file.Length -lt 1GB) {
+            throw "Arquivo pequeno demais. Verifique o URL."
           }
 
-          $ip = ($ipOutput | Select-Object -First 1).Trim()
+          Write-Host "Tamanho: $([math]::Round($file.Length / 1GB, 2)) GB"
 
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw 'Tailscale did not assign an IPv4 address.'
-          }
+          $hash = Get-FileHash $iso -Algorithm SHA256
+          Write-Host "SHA256: $($hash.Hash)"
 
-          "TAILSCALE_IP=$ip" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "ISO baixada. Isso nao significa que o Windows foi iniciado."
+          Write-Host "O runner hospedado nao garante suporte a uma VM Windows aninhada."
 
-          Write-Host "Tailscale IP assigned: $ip"
-
-      - name: Configure Remote Desktop
+      - name: Limpar arquivo temporario
+        if: always()
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $iso = Join-Path $env:RUNNER_TEMP `
+            "windows-26h2.iso"
 
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections `
-            -Value 0
-
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
-
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-
-          Write-Host 'Remote Desktop configuration completed.'
-
-      - name: Create Rafael Account
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $Username = 'Rafael'
-          $Password = 'Wl7mX#2026@Pc!'
-
-          $SecurePassword = ConvertTo-SecureString `
-            $Password -AsPlainText -Force
-
-          $User = Get-LocalUser -Name $Username `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $User) {
-            New-LocalUser `
-              -Name $Username `
-              -Password $SecurePassword `
-              -Description 'Windows account Rafael' `
-              -ErrorAction Stop | Out-Null
+          if (Test-Path $iso) {
+            Remove-Item $iso -Force
+            Write-Host "ISO temporaria removida."
           }
-          else {
-            Set-LocalUser `
-              -Name $Username `
-              -Password $SecurePassword `
-              -ErrorAction Stop
-          }
-
-          Enable-LocalUser -Name $Username
-
-          Add-LocalGroupMember `
-            -Group 'Remote Desktop Users' `
-            -Member $Username `
-            -ErrorAction SilentlyContinue
-
-          Write-Host 'Windows account configured.'
-
-      - name: Test RDP and Tailscale
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $listener = Get-NetTCPConnection `
-            -State Listen `
-            -LocalPort 3389 `
-            -ErrorAction SilentlyContinue
-
-          if ($listener) {
-            Write-Host 'RDP port 3389 is listening.'
-          }
-          else {
-            Write-Host 'RDP port 3389 is not listening.'
-          }
-
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $tailscale status
-
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-      - name: Show Connection Details
-        if: ${{ success() }}
-        shell: pwsh
-        run: |
-          Write-Host ''
-          Write-Host '======= VIRTUAL PC DETAILS ======='
-          Write-Host 'Account: Rafael'
-          Write-Host 'Password: Wl7mX#2026@Pc!'
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host 'RDP port: 3389'
-          Write-Host '=================================='
-
-      - name: Keep Runner Active
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $endTime = (Get-Date).AddHours(5)
-
-          while ((Get-Date) -lt $endTime) {
-            Write-Host "Runner active: $(Get-Date -Format 'HH:mm:ss')"
-            Start-Sleep -Seconds 60
-          }
-
-          Write-Host 'Wait period completed.'
+          
